@@ -1,6 +1,8 @@
 use core::marker::PhantomData;
+use core::ops::Deref;
+use std::ops::DerefMut;
 
-use crate::{CRC_SIZE, ETX, FOOTER_SIZE, HEADER_SIZE, STX, crc};
+use crate::{crc, CRC_SIZE, ETX, FOOTER_SIZE, HEADER_SIZE, STX};
 
 pub struct FrameToken<'a> {
     body_size: usize,
@@ -8,7 +10,7 @@ pub struct FrameToken<'a> {
 }
 
 impl<'a> FrameToken<'a> {
-    fn forge<'b>(self) -> FrameToken<'b> {
+    pub(crate) fn forge<'b>(self) -> FrameToken<'b> {
         FrameToken {
             body_size: self.body_size,
             phantom: PhantomData,
@@ -32,21 +34,95 @@ pub enum Error {
     Junk(ConsumeToken),
 }
 
-#[derive(Default)]
-pub struct Parser<const N: usize> {
-    buf: heapless::Vec<u8, N>,
+pub trait Buffer: Deref<Target = [u8]> + DerefMut {
+    #[allow(clippy::result_unit_err)]
+    fn extend_from_slice(&mut self, other: &[u8]) -> Result<(), ()>;
+    fn truncate(&mut self, len: usize);
+    fn is_full(&self) -> bool;
+    fn capacity(&self) -> usize;
 }
 
-impl<const N: usize> Parser<N> {
+impl<const N: usize> Buffer for heapless::Vec<u8, N> {
+    #[inline]
+    fn extend_from_slice(&mut self, other: &[u8]) -> Result<(), ()> {
+        heapless::Vec::extend_from_slice(self, other)
+    }
+
+    #[inline]
+    fn truncate(&mut self, len: usize) {
+        heapless::Vec::truncate(self, len)
+    }
+
+    #[inline]
+    fn is_full(&self) -> bool {
+        heapless::Vec::is_full(self)
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        heapless::Vec::capacity(self)
+    }
+}
+
+#[cfg(any(test, feature = "alloc"))]
+mod alloc_support {
+    extern crate alloc;
+    use super::Buffer;
+
+    impl Buffer for alloc::vec::Vec<u8> {
+        fn extend_from_slice(&mut self, other: &[u8]) -> Result<(), ()> {
+            if Vec::len(self) + other.len() > Vec::capacity(self) {
+                Err(())
+            } else {
+                Vec::extend_from_slice(self, other);
+                Ok(())
+            }
+        }
+
+        #[inline]
+        fn truncate(&mut self, len: usize) {
+            Vec::truncate(self, len);
+        }
+
+        #[inline]
+        fn is_full(&self) -> bool {
+            Vec::len(self) == Vec::capacity(self)
+        }
+
+        #[inline]
+        fn capacity(&self) -> usize {
+            Vec::capacity(self)
+        }
+    }
+}
+
+#[cfg(any(test, feature = "alloc"))]
+#[doc(inline)]
+pub use alloc_support::*;
+
+#[derive(Default)]
+pub struct Parser<B> {
+    buf: B,
+}
+
+impl<B> Parser<B>
+where
+    B: Buffer,
+{
     fn find_stx(&self) -> Option<usize> {
         self.buf.windows(STX.len()).position(|win| win == STX)
     }
 
-    pub fn with_buffer(buf: heapless::Vec<u8, N>) -> Self {
+    pub fn with_buffer(buf: B) -> Self {
         Self { buf }
     }
 
     #[inline]
+    #[must_use]
+    /// Attempts to write bytes from `input` into the internal buffer
+    /// and returns the number of bytes are written.
+    /// Note that this do not always the whole bytes of `input`,
+    /// for example, when the internal buffer is insufficient.
     pub fn fill(&mut self, input: &[u8]) -> usize {
         let copy_len = input.len().min(self.buf.capacity() - self.buf.len());
         self.buf
@@ -106,7 +182,7 @@ impl<const N: usize> Parser<N> {
         &self.buf[HEADER_SIZE..HEADER_SIZE + token.body_size]
     }
 
-    const fn max_frame_size(&self) -> usize {
+    fn max_frame_size(&self) -> usize {
         self.buf.capacity()
     }
 
@@ -133,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_empty_input() {
-        let mut rdr = Parser::<32>::default();
+        let mut rdr = Parser::with_buffer(heapless::Vec::<_, 32>::new());
         let input = [];
         assert_eq!(rdr.fill(&input), 0);
     }
@@ -167,7 +243,7 @@ mod tests {
     proptest! {
         #[test]
         fn test_reader(mut segs in chop(VALID_DEADBEEF_CASE)) {
-            let mut rdr = Parser::<12>::default();
+            let mut rdr = Parser::with_buffer(heapless::Vec::<_, 12>::new());
             let last = segs.pop().unwrap();
             for seg in segs {
                 assert_eq!(rdr.fill(seg), seg.len());
@@ -184,7 +260,7 @@ mod tests {
         #[test]
         fn test_insufficient_buf(mut segs in chop(VALID_DEADBEEF_CASE)) {
             const BUF_SIZE: usize = VALID_DEADBEEF_CASE.len() - 1;
-            let mut rdr = Parser::<BUF_SIZE>::default();
+            let mut rdr = Parser::with_buffer(heapless::Vec::<_, BUF_SIZE>::new());
             let last = segs.pop().unwrap();
             for seg in segs {
                 assert_eq!(rdr.fill(seg), seg.len());
@@ -195,7 +271,7 @@ mod tests {
 
         #[test]
         fn test_double_input(segs in chop(&VALID_DEADBEEF_CASE.iter().chain(VALID_HELLOWORLD_CASE.iter()).cloned().collect::<Vec<_>>())) {
-            let mut rdr = Parser::<32>::default();
+            let mut rdr = Parser::with_buffer(heapless::Vec::<_, 32>::new());
             let mut iter = segs.into_iter();
             let mut found = vec![];
             for seg in &mut iter {
