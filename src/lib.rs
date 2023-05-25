@@ -1,5 +1,5 @@
-pub mod parser;
 pub mod crc;
+pub mod parser;
 
 pub const STX: [u8; 2] = [0xeb, 0x90];
 pub const ETX: [u8; 2] = [0xc5, 0x79];

@@ -1,6 +1,81 @@
 use core::marker::PhantomData;
 
-use crate::{CRC_SIZE, ETX, FOOTER_SIZE, HEADER_SIZE, STX, crc};
+use crate::{crc, CRC_SIZE, ETX, FOOTER_SIZE, HEADER_SIZE, STX};
+
+pub trait Buffer {
+    fn capacity(&self) -> usize;
+    fn len(&self) -> usize;
+    fn data(&self) -> (&[u8], &[u8]);
+    fn consume(&mut self, len: usize);
+    fn write(&mut self, input: &[u8]);
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl<const N: usize> Buffer for heapless::Deque<u8, N> {
+    fn capacity(&self) -> usize {
+        heapless::Deque::capacity(self)
+    }
+
+    fn len(&self) -> usize {
+        heapless::Deque::len(self)
+    }
+
+    fn data(&self) -> (&[u8], &[u8]) {
+        heapless::Deque::as_slices(self)
+    }
+
+    fn consume(&mut self, size: usize) {
+        if heapless::Deque::len(self) >= size {
+            for _ in 0..size {
+                unsafe {
+                    heapless::Deque::pop_front_unchecked(self);
+                }
+            }
+        }
+    }
+
+    fn write(&mut self, input: &[u8]) {
+        assert!(heapless::Deque::capacity(self) - heapless::Deque::len(self) >= input.len());
+        for &b in input {
+            unsafe { heapless::Deque::push_back_unchecked(self, b) }
+        }
+    }
+}
+
+#[inline]
+fn slices_start<'a>((a, b): (&'a [u8], &'a [u8]), start: usize) -> (&'a [u8], &'a [u8]) {
+    debug_assert!(start < a.len() + b.len());
+    if start < a.len() {
+        (&a[start..], b)
+    } else {
+        (&[], &b[start - a.len()..])
+    }
+}
+
+#[inline]
+fn slices_endx<'a>((a, b): (&'a [u8], &'a [u8]), endx: usize) -> (&'a [u8], &'a [u8]) {
+    debug_assert!(endx <= a.len() + b.len());
+    if endx <= a.len() {
+        (&a[..endx], &[])
+    } else {
+        (&[], &b[..endx - a.len()])
+    }
+}
+
+#[inline]
+fn slices_read_u16((a, b): (&[u8], &[u8]), index: usize) -> u16 {
+    use core::cmp::Ordering;
+    let s = index;
+    let t = index + 1;
+    match a.len().cmp(&t) {
+        Ordering::Greater => u16::from_be_bytes([a[s], a[t]]),
+        Ordering::Less => u16::from_be_bytes([b[s - a.len()], b[t - a.len()]]),
+        Ordering::Equal => u16::from_be_bytes([a[s], b[0]]),
+    }
+}
 
 pub struct FrameToken<'a> {
     body_size: usize,
@@ -8,7 +83,7 @@ pub struct FrameToken<'a> {
 }
 
 impl<'a> FrameToken<'a> {
-    fn forge<'b>(self) -> FrameToken<'b> {
+    pub(crate) fn forge<'b>(self) -> FrameToken<'b> {
         FrameToken {
             body_size: self.body_size,
             phantom: PhantomData,
@@ -33,36 +108,46 @@ pub enum Error {
 }
 
 #[derive(Default)]
-pub struct Parser<const N: usize> {
-    buf: heapless::Vec<u8, N>,
+pub struct Parser<B> {
+    buf: B,
 }
 
-impl<const N: usize> Parser<N> {
+impl<B> Parser<B>
+where
+    B: Buffer,
+{
     fn find_stx(&self) -> Option<usize> {
-        self.buf.windows(STX.len()).position(|win| win == STX)
+        let (buf_a, buf_b) = self.buf.data();
+        if let Some(p) = buf_a.windows(STX.len()).position(|win| win == STX) {
+            return Some(p);
+        }
+        if buf_a.len() & 1 == 1 && !buf_b.is_empty() && [buf_a[buf_a.len() - 1], buf_b[0]] == STX {
+            return Some(buf_a.len() - 1);
+        }
+        if let Some(p) = buf_b.windows(STX.len()).position(|win| win == STX) {
+            return Some(p + buf_a.len());
+        }
+        None
     }
 
-    pub fn with_buffer(buf: heapless::Vec<u8, N>) -> Self {
+    pub fn with_buffer(buf: B) -> Self {
         Self { buf }
     }
 
     #[inline]
     pub fn fill(&mut self, input: &[u8]) -> usize {
         let copy_len = input.len().min(self.buf.capacity() - self.buf.len());
-        self.buf
-            .extend_from_slice(&input[..copy_len])
-            .expect("never panic");
+        self.buf.write(&input[..copy_len]);
         copy_len
     }
 
     pub fn is_full(&self) -> bool {
-        self.buf.is_full()
+        self.buf.len() == self.buf.capacity()
     }
 
     pub fn consume(&mut self, token: ConsumeToken) {
         let ConsumeToken { len } = token;
-        self.buf.copy_within(len.., 0);
-        self.buf.truncate(self.buf.len() - len);
+        self.buf.consume(len);
     }
 
     pub fn read(&self) -> Result<FrameToken, Error> {
@@ -79,14 +164,18 @@ impl<const N: usize> Parser<N> {
                 if self.buf.len() < frame_size {
                     return Err(Error::Incomplete);
                 }
-                let frame = &self.buf[..frame_size];
-                let (_header, tail) = frame.split_at(HEADER_SIZE);
-                let (body, footer) = tail.split_at(body_size);
-                let (expected_crc, etx) = footer.split_at(CRC_SIZE);
-                if etx != ETX {
+                let tail = slices_start(self.buf.data(), HEADER_SIZE);
+                let footer = slices_start(tail, body_size);
+                let body = slices_endx(tail, body_size);
+                let expected_crc = slices_read_u16(footer, 0);
+                let etx = slices_read_u16(footer, CRC_SIZE);
+                if etx != u16::from_be_bytes(ETX) {
                     return Err(Error::Junk(ConsumeToken { len: STX.len() }));
                 }
-                let actual_crc = crc::checksum(body);
+                let mut digest = crc::ALGO.digest();
+                digest.update(body.0);
+                digest.update(body.1);
+                let actual_crc = digest.finalize();
                 if expected_crc != actual_crc {
                     return Err(Error::Junk(ConsumeToken { len: STX.len() }));
                 }
@@ -102,17 +191,17 @@ impl<const N: usize> Parser<N> {
         }
     }
 
-    pub fn get_body(&self, token: &FrameToken) -> &[u8] {
-        &self.buf[HEADER_SIZE..HEADER_SIZE + token.body_size]
+    pub fn get_body(&self, token: &FrameToken) -> (&[u8], &[u8]) {
+        slices_endx(slices_start(self.buf.data(), HEADER_SIZE), token.body_size)
     }
 
-    const fn max_frame_size(&self) -> usize {
+    fn max_frame_size(&self) -> usize {
         self.buf.capacity()
     }
 
-    #[inline]
     fn body_size(&self) -> u16 {
-        u16::from_be_bytes([self.buf[2], self.buf[3]])
+        debug_assert!(self.buf.len() >= HEADER_SIZE);
+        slices_read_u16(self.buf.data(), STX.len())
     }
 }
 
@@ -131,9 +220,16 @@ mod tests {
         0x39, 0xc1, 0xc5, 0x79,
     ];
 
+    fn make_contiguous((a, b): (&[u8], &[u8])) -> Vec<u8> {
+        let mut v = Vec::with_capacity(a.len() + b.len());
+        v.extend_from_slice(a);
+        v.extend_from_slice(b);
+        v
+    }
+
     #[test]
     fn test_empty_input() {
-        let mut rdr = Parser::<32>::default();
+        let mut rdr = Parser::with_buffer(heapless::Deque::<u8, 32>::new());
         let input = [];
         assert_eq!(rdr.fill(&input), 0);
     }
@@ -167,7 +263,7 @@ mod tests {
     proptest! {
         #[test]
         fn test_reader(mut segs in chop(VALID_DEADBEEF_CASE)) {
-            let mut rdr = Parser::<12>::default();
+            let mut rdr = Parser::with_buffer(heapless::Deque::<u8, 12>::new());
             let last = segs.pop().unwrap();
             for seg in segs {
                 assert_eq!(rdr.fill(seg), seg.len());
@@ -175,7 +271,7 @@ mod tests {
             assert_eq!(rdr.fill(last), last.len());
             if let Ok(ft) = rdr.read() {
                 assert_eq!(ft.body_size, 4);
-                assert_eq!(rdr.get_body(&ft), DEADBEEF);
+                assert_eq!(make_contiguous(rdr.get_body(&ft)), DEADBEEF);
             } else {
                 panic!();
             }
@@ -184,7 +280,7 @@ mod tests {
         #[test]
         fn test_insufficient_buf(mut segs in chop(VALID_DEADBEEF_CASE)) {
             const BUF_SIZE: usize = VALID_DEADBEEF_CASE.len() - 1;
-            let mut rdr = Parser::<BUF_SIZE>::default();
+            let mut rdr = Parser::with_buffer(heapless::Deque::<u8, BUF_SIZE>::new());
             let last = segs.pop().unwrap();
             for seg in segs {
                 assert_eq!(rdr.fill(seg), seg.len());
@@ -195,7 +291,7 @@ mod tests {
 
         #[test]
         fn test_double_input(segs in chop(&VALID_DEADBEEF_CASE.iter().chain(VALID_HELLOWORLD_CASE.iter()).cloned().collect::<Vec<_>>())) {
-            let mut rdr = Parser::<32>::default();
+            let mut rdr = Parser::with_buffer(heapless::Deque::<u8, 32>::new());
             let mut iter = segs.into_iter();
             let mut found = vec![];
             for seg in &mut iter {
@@ -207,7 +303,7 @@ mod tests {
                         match rdr.read() {
                             Ok(ft) => {
                                 let body = rdr.get_body(&ft);
-                                found.push(body.to_vec());
+                                found.push(make_contiguous(body));
                                 let t = ft.into();
                                 rdr.consume(t);
                             },
