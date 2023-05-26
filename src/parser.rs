@@ -137,7 +137,14 @@ impl<'a> From<FrameToken<'a>> for ConsumeToken {
 
 pub enum Error {
     Incomplete,
-    Junk(ConsumeToken),
+    Junk { token: ConsumeToken, kind: JunkKind },
+}
+
+pub enum JunkKind {
+    InvalidStx,
+    InvalidLength,
+    InvalidCrc,
+    InvalidEtx,
 }
 
 #[derive(Default)]
@@ -192,7 +199,10 @@ where
                 let body_size = self.body_size() as usize;
                 let frame_size = body_size + HEADER_SIZE + FOOTER_SIZE;
                 if frame_size > self.max_frame_size() {
-                    return Err(Error::Junk(ConsumeToken { len: STX.len() }));
+                    return Err(Error::Junk {
+                        token: ConsumeToken { len: STX.len() },
+                        kind: JunkKind::InvalidLength,
+                    });
                 }
                 if self.buf.len() < frame_size {
                     return Err(Error::Incomplete);
@@ -203,24 +213,36 @@ where
                 let expected_crc = slices_read_u16(footer, 0);
                 let etx = slices_read_u16(footer, CRC_SIZE);
                 if etx != u16::from_be_bytes(ETX) {
-                    return Err(Error::Junk(ConsumeToken { len: STX.len() }));
+                    return Err(Error::Junk {
+                        token: ConsumeToken { len: STX.len() },
+                        kind: JunkKind::InvalidEtx,
+                    });
                 }
                 let mut digest = crc::ALGO.digest();
                 digest.update(body.0);
                 digest.update(body.1);
                 let actual_crc = digest.finalize();
                 if expected_crc != actual_crc {
-                    return Err(Error::Junk(ConsumeToken { len: STX.len() }));
+                    return Err(Error::Junk {
+                        token: ConsumeToken { len: STX.len() },
+                        kind: JunkKind::InvalidCrc,
+                    });
                 }
                 Ok(FrameToken {
                     body_size,
                     phantom: PhantomData,
                 })
             }
-            Some(pos) => Err(Error::Junk(ConsumeToken { len: pos })),
-            None => Err(Error::Junk(ConsumeToken {
-                len: self.buf.len() - (STX.len() - 1),
-            })),
+            Some(pos) => Err(Error::Junk {
+                token: ConsumeToken { len: pos },
+                kind: JunkKind::InvalidStx,
+            }),
+            None => Err(Error::Junk {
+                token: ConsumeToken {
+                    len: self.buf.len() - (STX.len() - 1),
+                },
+                kind: JunkKind::InvalidStx,
+            }),
         }
     }
 
@@ -319,7 +341,7 @@ mod tests {
                 assert_eq!(rdr.fill(seg), seg.len());
             }
             assert_ne!(rdr.fill(last), last.len());
-            assert!(matches!(rdr.read(), Err(Error::Junk(_))));
+            assert!(matches!(rdr.read(), Err(Error::Junk { .. })));
         }
 
         #[test]
@@ -340,7 +362,7 @@ mod tests {
                                 let t = ft.into();
                                 rdr.consume(t);
                             },
-                            Err(Error::Junk(token)) => {
+                            Err(Error::Junk { token, .. }) => {
                                 rdr.consume(token);
                             },
                             Err(Error::Incomplete) => {
