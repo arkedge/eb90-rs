@@ -28,11 +28,10 @@ impl<const N: usize> Buffer for heapless::Deque<u8, N> {
     }
 
     fn consume(&mut self, size: usize) {
-        if heapless::Deque::len(self) >= size {
-            for _ in 0..size {
-                unsafe {
-                    heapless::Deque::pop_front_unchecked(self);
-                }
+        assert!(heapless::Deque::len(self) >= size);
+        for _ in 0..size {
+            unsafe {
+                heapless::Deque::pop_front_unchecked(self);
             }
         }
     }
@@ -44,6 +43,40 @@ impl<const N: usize> Buffer for heapless::Deque<u8, N> {
         }
     }
 }
+
+#[cfg(any(test, feature = "alloc"))]
+mod alloc_support {
+    extern crate alloc;
+    use super::*;
+    use alloc::collections::VecDeque;
+
+    impl Buffer for VecDeque<u8> {
+        fn capacity(&self) -> usize {
+            VecDeque::capacity(self)
+        }
+
+        fn len(&self) -> usize {
+            VecDeque::len(self)
+        }
+
+        fn data(&self) -> (&[u8], &[u8]) {
+            VecDeque::as_slices(self)
+        }
+
+        fn consume(&mut self, len: usize) {
+            VecDeque::drain(self, ..len);
+        }
+
+        fn write(&mut self, input: &[u8]) {
+            assert!(VecDeque::capacity(self) - VecDeque::len(self) >= input.len());
+            VecDeque::extend(self, input.iter());
+        }
+    }
+}
+
+#[cfg(any(test, feature = "alloc"))]
+#[doc(inline)]
+pub use alloc_support::*;
 
 #[inline]
 fn slices_start<'a>((a, b): (&'a [u8], &'a [u8]), start: usize) -> (&'a [u8], &'a [u8]) {

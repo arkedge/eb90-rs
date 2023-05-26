@@ -11,3 +11,7 @@ crc = "2"
 
 [dev-dependencies]
 proptest = "1"
+
+[features]
+default = ["alloc"]
+alloc = []
