@@ -116,7 +116,8 @@ pub struct FrameToken<'a> {
 }
 
 impl<'a> FrameToken<'a> {
-    pub(crate) fn forge<'b>(self) -> FrameToken<'b> {
+    #[doc(hidden)]
+    pub fn forge<'b>(self) -> FrameToken<'b> {
         FrameToken {
             body_size: self.body_size,
             phantom: PhantomData,
