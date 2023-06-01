@@ -141,6 +141,7 @@ pub enum Error {
     Junk { token: ConsumeToken, kind: JunkKind },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JunkKind {
     InvalidStx,
     InvalidLength,
