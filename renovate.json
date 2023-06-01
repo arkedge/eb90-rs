@@ -1,0 +1,24 @@
+{
+  "extends": [
+    "config:base"
+  ],
+  "lockFileMaintenance": { "enabled": true },
+  "packageRules": [
+    {
+      "groupName": "Rust",
+      "groupSlug": "rust",
+      "packageNames": ["rust"]
+    }
+  ],
+  "regexManagers": [
+    {
+      "fileMatch": ["^rust-toolchain(\\.toml)?$"],
+      "matchStrings": [
+        "channel\\s*=\\s*\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "depNameTemplate": "rust",
+      "lookupNameTemplate": "rust-lang/rust",
+      "datasourceTemplate": "github-releases"
+    },
+  ]
+}
