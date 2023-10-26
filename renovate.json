@@ -19,6 +19,6 @@
       "depNameTemplate": "rust",
       "lookupNameTemplate": "rust-lang/rust",
       "datasourceTemplate": "github-releases"
-    },
+    }
   ]
 }
