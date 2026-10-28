@@ -94,7 +94,7 @@ fn slices_endx<'a>((a, b): (&'a [u8], &'a [u8]), endx: usize) -> (&'a [u8], &'a 
     if endx <= a.len() {
         (&a[..endx], &[])
     } else {
-        (&[], &b[..endx - a.len()])
+        (a, &b[..endx - a.len()])
     }
 }
 
@@ -163,7 +163,7 @@ where
         if let Some(p) = buf_a.windows(STX.len()).position(|win| win == STX) {
             return Some(p);
         }
-        if buf_a.len() & 1 == 1 && !buf_b.is_empty() && [buf_a[buf_a.len() - 1], buf_b[0]] == STX {
+        if !buf_a.is_empty() && !buf_b.is_empty() && [buf_a[buf_a.len() - 1], buf_b[0]] == STX {
             return Some(buf_a.len() - 1);
         }
         if let Some(p) = buf_b.windows(STX.len()).position(|win| win == STX) {
@@ -289,6 +289,31 @@ mod tests {
         let mut rdr = Parser::with_buffer(heapless::Deque::<u8, 32>::new());
         let input = [];
         assert_eq!(rdr.fill(&input), 0);
+    }
+
+    /// リングバッファの書き始めの位置を 1 バイトずつずらし、フレームが端をまたぐすべての場合に読めることを確かめる。
+    /// STX の前に junk を置き、STX が端をまたぐときの as_slices の前半の長さが奇数・偶数のどちらにもなるようにする
+    #[test]
+    fn test_wraparound() {
+        const N: usize = 16;
+        for lead in 0..=N - VALID_DEADBEEF_CASE.len() {
+            for offset in 0..N {
+                let mut rdr = Parser::with_buffer(heapless::Deque::<u8, N>::new());
+                let zeros = [0u8; N];
+                assert_eq!(rdr.fill(&zeros[..offset]), offset);
+                rdr.consume(ConsumeToken { len: offset });
+                assert_eq!(rdr.fill(&zeros[..lead]), lead);
+                assert_eq!(rdr.fill(VALID_DEADBEEF_CASE), VALID_DEADBEEF_CASE.len());
+                let body = loop {
+                    match rdr.read() {
+                        Ok(ft) => break make_contiguous(rdr.get_body(&ft)),
+                        Err(Error::Junk { token, .. }) => rdr.consume(token),
+                        Err(Error::Incomplete) => panic!("frame lost: lead={lead} offset={offset}"),
+                    }
+                };
+                assert_eq!(body, DEADBEEF, "lead={lead} offset={offset}");
+            }
+        }
     }
 
     /// バイト列を適当にぶつ切りにする proptest Strategy
